@@ -4,6 +4,7 @@ Implements mapping of OpenAI datastructures to Pydantic friendly types.
 """
 
 import enum
+import importlib.metadata
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import timedelta
@@ -28,6 +29,7 @@ from agents import (
     UserError,
     WebSearchTool,
 )
+from agents import __version__ as _agents_version
 from agents.items import TResponseStreamEvent
 from agents.tool import (
     ApplyPatchTool,
@@ -53,6 +55,7 @@ from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
     _WorkerEnvRefResolver,
 )
+from temporalio.service import __version__ as _sdk_version
 
 
 @dataclass
@@ -66,6 +69,23 @@ class HandoffInput:
     input_json_schema: dict[str, Any]
     agent_name: str
     strict_json_schema: bool = True
+
+
+_default_openai_user_agent = f"Temporal/{_sdk_version} openai-agents/{_agents_version}"
+try:
+    _plugin_version = importlib.metadata.version("temporalio-openai-agents")
+except importlib.metadata.PackageNotFoundError:
+    pass
+else:
+    _default_openai_user_agent = (
+        f"{_default_openai_user_agent} temporalio-openai-agents/{_plugin_version}"
+    )
+
+_default_openai_headers = {
+    "User-Agent": _default_openai_user_agent,
+    "HTTP-Referer": "https://temporal.io/",
+    "X-Title": "Temporal OpenAI Agents",
+}
 
 
 @dataclass
@@ -352,6 +372,9 @@ def _raise_for_openai_status(e: APIStatusError) -> NoReturn:
 class ModelActivity:
     """Class wrapper for model invocation activities to allow model customization. By default, we use an OpenAIProvider with retries disabled.
     Disabling retries in your model of choice is recommended to allow activity retries to define the retry model.
+
+    The default OpenAI client is attributed to the Temporal SDK with per-request
+    attribution headers.
     """
 
     def __init__(
@@ -361,7 +384,9 @@ class ModelActivity:
     ):
         """Initialize the activity with a model provider."""
         self._model_provider = model_provider or OpenAIProvider(
-            openai_client=AsyncOpenAI(max_retries=0)
+            openai_client=AsyncOpenAI(
+                max_retries=0, default_headers=_default_openai_headers
+            )
         )
         self._env_refs = _WorkerEnvRefResolver(resolvable_worker_env_vars)
 
