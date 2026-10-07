@@ -19,3 +19,4 @@ cadence.
 | [`python/mcp`](python/mcp) | [![PyPI](https://img.shields.io/pypi/v/temporalio-mcp.svg)](https://pypi.org/project/temporalio-mcp/) (Public Preview) |
 | [`python/openai_agents`](python/openai_agents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-openai-agents.svg)](https://pypi.org/project/temporalio-openai-agents/) |
 | [`python/strands_agents`](python/strands_agents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-strands-agents.svg)](https://pypi.org/project/temporalio-strands-agents/) (Public Preview) |
+| [`python/typesafe`](python/typesafe) | `temporalio-typesafe` | `temporalio.typesafe` | [Pre-release](https://github.com/temporalio/ai-integrations/blob/main/python/typesafe/README.md) |
