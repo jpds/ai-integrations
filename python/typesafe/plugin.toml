@@ -17,4 +17,4 @@ allow-final = true
 runtime-versions = ["3.10", "3.14"]
 
 [smoke]
-imports = ["temporalio.typesafe._plugin", "temporalio.typesafe._workflow"]
+imports = ["temporalio.typesafe._plugin", "temporalio.typesafe._workflow", "temporalio.typesafe.workflow"]
