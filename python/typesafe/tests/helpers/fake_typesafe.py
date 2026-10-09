@@ -91,7 +91,7 @@ def fake_typesafe_responder(
     )
 
 
-def canned_client(
+def mock_client(
     status: int = 200,
     headers: dict[str, str] | None = None,
     extra: dict[str, Any] | None = None,

@@ -10,21 +10,19 @@ credentials.
 Every public symbol loads lazily, so importing the workflow module never
 executes worker-only imports.
 
-This package is public preview and may change in future versions.
+This package is Pre-release and may change in future versions.
 """
 
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from temporalio.typesafe._client_backend import TypeSafeClientFactory
     from temporalio.typesafe._plugin import TypeSafePlugin
-    from temporalio.typesafe._types import AskResult
+    from temporalio.typesafe._types import SystemOneResult
     from temporalio.typesafe._workflow import TemporalTypeSafe
 
 __all__ = [
-    "AskResult",
+    "SystemOneResult",
     "TemporalTypeSafe",
-    "TypeSafeClientFactory",
     "TypeSafePlugin",
 ]
 
@@ -35,11 +33,7 @@ def __getattr__(name: str) -> Any:
         from temporalio.typesafe import _plugin
 
         return getattr(_plugin, name)
-    if name == "TypeSafeClientFactory":
-        from temporalio.typesafe import _client_backend
-
-        return getattr(_client_backend, name)
-    if name == "AskResult":
+    if name == "SystemOneResult":
         from temporalio.typesafe import _types
 
         return getattr(_types, name)

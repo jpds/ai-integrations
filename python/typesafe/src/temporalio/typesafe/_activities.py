@@ -1,8 +1,9 @@
 """TypeSafe Activities: one execution is one ``POST /v1/systemone``.
 
 Every supplied question runs in that one request against one state. Fan-out
-over many states lives on the workflow side, where gathering and deduping are
-durable. No heartbeats: calls are short, and a hung one is visible in the UI.
+over many states lives on the workflow side, where ``asyncio.gather`` schedules
+independent durable calls. No heartbeats: calls are short, and a hung one is
+visible in the UI.
 """
 
 from __future__ import annotations
@@ -10,13 +11,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import httpx2
 from typesafe_sdk import AsyncTypeSafeClient, TypeSafeError
 
 from temporalio import activity
-from temporalio.typesafe._client_backend import attempt_timeout
 from temporalio.typesafe._errors import translate_exception
-from temporalio.typesafe._types import AskInput, lookup_response_model
+from temporalio.typesafe._types import SystemOneInput, lookup_response_model
 
 _STANDARD_REQUEST_ID_HEADER = "x-request-id"
 """De-facto standard response header carrying a server-side request ID."""
@@ -43,31 +42,21 @@ class TypeSafeActivities:
     """The Activities registered by :class:`temporalio.typesafe.TypeSafePlugin`.
 
     Args:
-        ask: Callable that returns the TypeSafe client for this loop.
+        client: The caller-configured TypeSafe SDK client.
     """
 
     def __init__(
         self,
-        ask: Any,
-        *,
-        timeout: float | httpx2.Timeout | None = None,
-        timeout_reserve: float | None = None,
+        client: AsyncTypeSafeClient,
     ) -> None:
-        """Construct the holder around one client provider.
-
-        ``timeout`` is the plugin's HTTP ceiling; ``timeout_reserve`` holds
-        that much time back from every attempt's budget before the ceiling
-        applies, so receiving and decoding always have room.
-        """
-        self._ask = ask
-        self._timeout = timeout
-        self._timeout_reserve = timeout_reserve
+        """Construct the holder around the caller-configured SDK client."""
+        self._client = client
         self.activities = [
-            self.ask_activity,
+            self.system_one_activity,
         ]
 
-    @activity.defn(name="temporalio.typesafe.ask")
-    async def ask_activity(self, payload: AskInput) -> dict[str, Any]:
+    @activity.defn(name="temporalio.typesafe.system_one")
+    async def system_one_activity(self, payload: SystemOneInput) -> dict[str, Any]:
         """Answer every question in one TypeSafe request against one state.
 
         ``payload.model_name`` names the request's model when the workflow
@@ -79,8 +68,8 @@ class TypeSafeActivities:
 
         Returns plain JSON dicts; the workflow side decodes them into typed
         answers. ``request_id`` carries the backend's request ID from the
-        response headers, when it reported one. Any failure, from building the
-        provider's client through a 200 whose body fails the response schema,
+        response headers, when it reported one. Any failure, from using the
+        SDK client through a 200 whose body fails the response schema,
         is translated by the errors module.
         """
         state_wire: Any = payload.state
@@ -89,17 +78,11 @@ class TypeSafeActivities:
         try:
             # Inside the block so an unregistered name fails non-retryably.
             response_model = lookup_response_model(payload.response_model)
-            client: AsyncTypeSafeClient = self._ask()
-            response = await client.system_one(
+            response = await self._client.system_one(
                 state=state_wire,
                 questions=dict(payload.questions),
                 model=payload.model_name,
                 response_model=response_model,
-                timeout=attempt_timeout(
-                    activity.info() if activity.in_activity() else None,
-                    self._timeout,
-                    self._timeout_reserve,
-                ),
             )
         except Exception as err:
             translate_exception(err)  # always raises, chaining the original

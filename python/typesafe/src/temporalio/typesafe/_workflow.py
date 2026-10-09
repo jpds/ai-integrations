@@ -1,9 +1,7 @@
 """Workflow-side durable TypeSafe proxy.
 
-:class:`TemporalTypeSafe` schedules the plugin's ``ask`` Activity by name and
+:class:`TemporalTypeSafe` schedules the plugin's ``system_one`` Activity by name and
 rebuilds the SDK's ``SystemOneResponse`` from the recorded payload.
-:meth:`ask_all` deduplicates states and fans one durable execution per state,
-gathered in input order.
 
 ``_errors`` is deliberately not imported here: its ``email.utils`` import
 trips the workflow sandbox on a stdlib module workflow code never uses.
@@ -11,9 +9,8 @@ trips the workflow sandbox on a stdlib module workflow code never uses.
 
 from __future__ import annotations
 
-import asyncio
 import json
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from typing import Any
 
@@ -21,23 +18,25 @@ from typesafe_sdk import Choice, Noul, Score, SystemOneResponse
 
 from temporalio import workflow
 from temporalio.typesafe._types import (
-    AskInput,
-    AskResult,
+    SystemOneInput,
+    SystemOneResult,
     lookup_response_model,
 )
 from temporalio.workflow import ActivityConfig
 
-ACTIVITY_ASK = "temporalio.typesafe.ask"
+ACTIVITY_SYSTEM_ONE = "temporalio.typesafe.system_one"
 """Activity name registered by the plugin."""
 
-DEFAULT_START_TO_CLOSE_TIMEOUT = timedelta(seconds=5)
+DEFAULT_START_TO_CLOSE_TIMEOUT = timedelta(seconds=30)
 """Attempt budget the proxy adds when the config names neither timeout.
 
-The Activity clamps its HTTP waits to this budget, so large states need a
-longer one."""
+The caller configures the SDK client's HTTP timeouts independently, so this
+default leaves room beyond the SDK's default 10s HTTP operation timeout."""
 
 
-def _decode_result(raw: dict[str, Any], response_model_name: str | None) -> AskResult:
+def _decode_result(
+    raw: dict[str, Any], response_model_name: str | None
+) -> SystemOneResult:
     """Rebuild the native TypeSafe response from its recorded payload.
 
     Validation goes through the JSON form: the Activity records the response
@@ -47,7 +46,7 @@ def _decode_result(raw: dict[str, Any], response_model_name: str | None) -> AskR
     like the SDK's own decode path.
     """
     model = lookup_response_model(response_model_name) or SystemOneResponse
-    return AskResult(
+    return SystemOneResult(
         # The correlation ID rides outside the response's own fields.
         response=model.model_validate_json(
             json.dumps(
@@ -81,9 +80,9 @@ def _questions_payload(
 
 
 class TemporalTypeSafe:
-    """A workflow-side view of the ``ask`` Activity.
+    """A workflow-side view of the ``system_one`` Activity.
 
-    Every question in one :meth:`ask` call goes out in a single request
+    Every question in one :meth:`system_one` call goes out in a single request
     against one state, and each is answered independently.
     """
 
@@ -99,15 +98,15 @@ class TemporalTypeSafe:
         Args:
             model: Model sent with every call, recorded in the Activity input.
                 ``None`` records no name, so the client serves its configured
-                default (plugin kwarg, ``TYPESAFE_DEFAULT_MODEL`` env, or
+                default (SDK client setting, ``TYPESAFE_DEFAULT_MODEL`` env, or
                 ``jev-latest``).
             activity_config: Temporal options for every backing Activity, such
                 as ``start_to_close_timeout``, ``retry_policy``, and
-                ``summary``. A 5 s ``start_to_close_timeout`` is added when the
+                ``summary``. A 30s ``start_to_close_timeout`` is added when the
                 config names neither timeout. Each call merges its own config
                 over these.
             response_model: Registry name from
-                ``TypeSafePlugin(response_models=...)`` whose
+                ``TypeSafePlugin(client, response_models=...)`` whose
                 ``SystemOneResponse`` subclass validates the response.
                 ``None`` uses the SDK's default parsing.
         """
@@ -131,7 +130,7 @@ class TemporalTypeSafe:
         merged.update(override)
         return merged
 
-    async def ask(
+    async def system_one(
         self,
         state: Mapping[str, Any] | Sequence[Any] | str,
         questions: Mapping[str, Choice | Noul | Score | dict[str, Any]],
@@ -139,7 +138,7 @@ class TemporalTypeSafe:
         model: str | None = None,
         activity_config: ActivityConfig | None = None,
         response_model: str | None = None,
-    ) -> AskResult:
+    ) -> SystemOneResult:
         """Ask all questions about one state in one TypeSafe request.
 
         Args:
@@ -165,56 +164,6 @@ class TemporalTypeSafe:
         )
         return _decode_result(raw, response_model or self._response_model)
 
-    async def ask_all(
-        self,
-        states: Collection[Mapping[str, Any] | Sequence[Any] | str],
-        questions: Mapping[str, Choice | Noul | Score | dict[str, Any]],
-        *,
-        model: str | None = None,
-        activity_config: ActivityConfig | None = None,
-        response_model: str | None = None,
-    ) -> list[AskResult]:
-        """Ask the same questions of many states, durably fanned out.
-
-        Identical states share one Activity execution, so a duplicate is not
-        billed twice. Deduplication keys on each state's canonical JSON, so
-        only JSON-encodable states can be deduped (and passed at all).
-        Every unique state is scheduled up front; how many run at once on a
-        worker is that Worker's ``max_concurrent_activities`` setting.
-
-        Args:
-            states: One state per return slot; duplicates share executions.
-            questions: Sent with every state.
-            model: Per-call model override.
-            activity_config: Per-call Activity options, merged over the
-                instance's; entries set here win.
-            response_model: Per-call registry name override.
-
-        Returns:
-            One result per input state, in input order; each carries that
-            state's answers plus the model, token usage, and backend request
-            ID of the request that answered it.
-        """
-        payload = _questions_payload(questions)
-        # States are dicts and lists, so dedupe on canonical JSON instead of
-        # hashing them.
-        keys = [
-            json.dumps(state, sort_keys=True, separators=(",", ":")) for state in states
-        ]
-        unique: dict[str, Any] = {}
-        for state, key in zip(states, keys, strict=True):
-            unique.setdefault(key, state)
-        raw_groups = await self._execute_all(
-            states=list(unique.values()),
-            questions=payload,
-            model=model or self._model,
-            activity_config=self._merged_config(activity_config),
-            response_model=response_model or self._response_model,
-        )
-        raw_by_key = dict(zip(unique, raw_groups, strict=True))
-        model_name = response_model or self._response_model
-        return [_decode_result(raw_by_key[key], model_name) for key in keys]
-
     async def _execute(
         self,
         *,
@@ -224,11 +173,11 @@ class TemporalTypeSafe:
         activity_config: ActivityConfig,
         response_model: str | None,
     ) -> dict[str, Any]:
-        """Schedule one durable ask Activity, returning its raw dict."""
+        """Schedule one durable System One Activity, returning its raw dict."""
         return await workflow.execute_activity(
-            ACTIVITY_ASK,
+            ACTIVITY_SYSTEM_ONE,
             args=[
-                AskInput(
+                SystemOneInput(
                     state=state,
                     questions=questions,
                     model_name=model,
@@ -237,25 +186,3 @@ class TemporalTypeSafe:
             ],
             **activity_config,
         )
-
-    async def _execute_all(
-        self,
-        *,
-        states: Sequence[Any],
-        questions: dict[str, Any],
-        model: str | None,
-        activity_config: ActivityConfig,
-        response_model: str | None,
-    ) -> list[dict[str, Any]]:
-        """Fan one durable Activity per unique state."""
-
-        async def one(state: Any) -> dict[str, Any]:
-            return await self._execute(
-                state=state,
-                questions=questions,
-                model=model,
-                activity_config=activity_config,
-                response_model=response_model,
-            )
-
-        return await asyncio.gather(*(one(s) for s in states))

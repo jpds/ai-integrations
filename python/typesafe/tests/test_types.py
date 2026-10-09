@@ -15,7 +15,7 @@ from typesafe_sdk import (
 )
 
 from temporalio.typesafe._types import (
-    AskResult,
+    SystemOneResult,
     lookup_response_model,
     register_response_model,
 )
@@ -95,7 +95,7 @@ def test_decode_result_rebuilds_default_response() -> None:
         {**_response_body(), "request_id": "req-1"},
         None,
     )
-    assert isinstance(result, AskResult)
+    assert isinstance(result, SystemOneResult)
     assert result.request_id == "req-1"
     assert result.response.model == MODEL
     answer = result.response.answers["verdict"]

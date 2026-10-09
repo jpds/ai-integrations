@@ -18,7 +18,7 @@ def fake_info(
     started = datetime.now(timezone.utc) - elapsed
     return Info(
         activity_id="1",
-        activity_type="temporalio.typesafe.ask",
+        activity_type="temporalio.typesafe.system_one",
         attempt=1,
         current_attempt_scheduled_time=started,
         heartbeat_details=(),

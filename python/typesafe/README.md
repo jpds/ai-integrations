@@ -2,7 +2,7 @@
 
 > Release stage: [Pre-release](https://docs.temporal.io/develop/python/integrations/typesafe).
 
-Temporal integration for [TypeSafe](https://docs.typesafe.ai/concepts/system-one)
+Temporal integration for [TypeSafe](https://docs.typesafe.ai)
 decision calls, published as [`temporalio-typesafe`](https://pypi.org/project/temporalio-typesafe/)
 and imported as `temporalio.typesafe`.
 
@@ -22,26 +22,31 @@ Register `TypeSafePlugin` on the worker. The HTTP client and its credentials sta
 there, out of workflow history:
 
 ```python
+import os
+
+import httpx2
+from typesafe_sdk import AsyncTypeSafeClient, RetryPolicy
+
 from temporalio.client import Client
 from temporalio.typesafe import TypeSafePlugin
 
+typesafe_client = AsyncTypeSafeClient(
+    api_key=os.environ["TYPESAFE_API_KEY"],
+    model="jev-1.13.0",
+    timeout=httpx2.Timeout(30, connect=5),
+    retry=RetryPolicy(max_retries=0),  # Temporal owns retries
+)
+
 client = await Client.connect(
     "localhost:7233",
-    plugins=[
-        TypeSafePlugin(
-            # base_url="http://localhost:8000",  # endpoint override
-            # model="jev-1.13.0",  # pin an exact version
-            # api_key=os.environ["BACKEND_API_KEY"],  # credential sent to base_url, instead of TYPESAFE_API_KEY
-            # headers={"X-Request-Source": "triage"},
-            # timeout=httpx2.Timeout(30, connect=5),  # one network operation
-        )
-    ],
+    plugins=[TypeSafePlugin(typesafe_client)],
 )
 ```
 
 Workflow code asks questions through `TemporalTypeSafe`:
 
 ```python
+import asyncio
 from typing import Any
 
 from temporalio import workflow
@@ -55,13 +60,17 @@ class Triage:
 
     @workflow.run
     async def run(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        results = await TemporalTypeSafe().ask_all(
-            items,
-            questions={
-                "needs_attention": Noul(
-                    instructions="Does this item need attention today?",
-                )
-            },
+        typesafe = TemporalTypeSafe()
+        questions = {
+            "needs_attention": Noul(
+                instructions="Does this item need attention today?",
+            )
+        }
+        results = await asyncio.gather(
+            *(
+                typesafe.system_one(state=item, questions=questions)
+                for item in items
+            )
         )
         ranked = []
         for item, result in zip(items, results):
@@ -72,22 +81,21 @@ class Triage:
         return sorted(ranked, key=lambda d: -d["urgency"])
 ```
 
-The example uses `ask_all`, which fans one durable execution per state. The
-API has two entry points:
+`system_one(state, questions)` matches the SDK's method name and sends several
+questions about one state in a single request. Add more questions as keys in
+the mapping.
 
-- `ask(state, questions)`: several questions over one state in a single
-  request. Add more questions as more keys in the mapping; they are
-  evaluated in parallel.
-- `ask_all(states, questions)`: one execution per state, reusing executions
-  for duplicate states (compared as canonical JSON, so states must be
-  JSON-encodable). Every unique state is scheduled up front.
+For multiple states, the example uses `asyncio.gather()` to schedule one
+Activity per item and collect results in input order. Each call is independent;
+repeated states produce separate requests. Deduplicate inputs in workflow code
+if that is the behavior you need.
 
-The number of ask Activities running at once on a worker is capped by
+The number of System One Activities running at once on a worker is capped by
 Temporal's `Worker(max_concurrent_activities=...)` setting. It caps simultaneous
 Activity execution across that worker's workflows; the queued batch itself
 stays unbounded, so a slow run queues Activities instead of dropping them.
 
-Each result is an `AskResult`: `.response` is the SDK's own response, with
+Each result is a `SystemOneResult`: `.response` is the SDK's own response, with
 `.answers` keyed by question name, the served `.model`, and the request's token
 `.usage`. A `NoulAnswer` carries a single `.noul`: the probability (0-1) that
 the answer is yes, with 0.5 meaning undecided. Noul answers have no separate
@@ -95,41 +103,42 @@ confidence field; `.noul` is both the answer and the certainty. When the yes/no
 boundary is subtle, add `criteria` with `true` and `false` descriptions of what
 each outcome means.
 
-Retries ride Temporal's RetryPolicy. The client is built (or validated) with
+Retries ride Temporal's RetryPolicy. Configure the SDK client with
 `typesafe-sdk max_retries=0`, so no retry loop runs inside the SDK; the
 server's `retry-after` hint becomes `next_retry_delay`, and the caller's policy
-owns the timing. The plugin rejects a client or client factory that enables the
-SDK's own retries, and points callers at
+owns the timing. The plugin rejects clients that enable the SDK's own retries,
+and points callers at
 `TemporalTypeSafe(activity_config={"retry_policy": ...})` instead.
 
-Payloads at the Workflow/Activity boundary go through the Pydantic payload
+Payloads at Workflow/Activity and Workflow/client boundaries go through the Pydantic payload
 converter: the plugin upgrades a default payload converter and leaves an
-explicitly configured custom one alone, so a registered response instance
+explicitly configured custom one alone. Caller-supplied payload codecs and
+failure converter settings are preserved, so a registered response instance
 and score maps with integer keys round-trip in both directions.
 
-The ask Activity clamps every HTTP call to the attempt's own budget: one
-attempt's HTTP wait fits inside `started_time + start_to_close_timeout`
-(plus the earlier `scheduled_time + schedule_to_close_timeout` when set),
-less one second of reserve for receiving and decoding. The reserve is
-capped at half the remaining budget, so a short attempt still sends a
-request, and an attempt whose deadline has already passed fails retryably.
-`TypeSafePlugin(timeout=...)` stays a ceiling for one HTTP operation and
-defaults to the SDK's 10 s. Raise `start_to_close_timeout` and the HTTP
-waits widen into that room; the cap keeps configured
-`timeout=`/`httpx2.Timeout` bounds (a `Timeout` object's phases each clamp
-independently to the remaining budget, never widening a tighter one).
+The plugin uses the supplied SDK client's HTTP settings as configured. Set the
+client's HTTP timeout and the Activity timeout together: HTTP timeouts bound
+individual network operations, while Temporal's Activity timeout bounds an
+attempt. The plugin does not rewrite the client's HTTP options to fit an
+Activity deadline. Temporal timing out an attempt does not itself stop an
+in-flight provider request.
 
 Tune these layers:
 
 | Layer | What it bounds | Default | Knob |
 | --- | --- | --- | --- |
-| HTTP operation | One connect, read, write, or pooled-connection acquire | 10 s ceiling | `TypeSafePlugin(timeout=...)` |
-| Activity attempt | One whole Activity Task Execution, including all HTTP waits | None in Temporal; 5 s in `TemporalTypeSafe` | `start_to_close_timeout` in `activity_config`, on `TemporalTypeSafe(...)` or on a call |
+| HTTP operation | One connect, read, write, or pooled-connection acquire | SDK client setting | `AsyncTypeSafeClient(timeout=...)` |
+| Activity attempt | One whole Activity Task Execution, including all HTTP waits | 30s in `TemporalTypeSafe` | `start_to_close_timeout` in `activity_config`, on `TemporalTypeSafe(...)` or on a call |
 | Total duration | Queueing, every attempt, retries, and backoff | unbounded | `schedule_to_close_timeout` in `activity_config`, on `TemporalTypeSafe(...)` or on a call |
 
 ```python
-# Worker side: tune the ceiling for fine-grained bounds
-TypeSafePlugin(timeout=httpx2.Timeout(30, connect=5), timeout_reserve=2.0)
+# Worker side: configure HTTP bounds on the SDK client
+typesafe_client = AsyncTypeSafeClient(
+    api_key=os.environ["TYPESAFE_API_KEY"],
+    timeout=httpx2.Timeout(30, connect=5),
+    retry=RetryPolicy(max_retries=0),
+)
+plugin = TypeSafePlugin(typesafe_client)
 
 # Workflow side: widen the budget and bound the overall deadline even
 # when it retries.
@@ -139,41 +148,41 @@ s1 = TemporalTypeSafe(
         "schedule_to_close_timeout": timedelta(minutes=5),
     }
 )
-await s1.ask_all(items, questions)
+await s1.system_one(state=state, questions=questions)
 ```
 
-Three notes tie this to the retry behavior above. First, the HTTP ceiling
-and each `httpx2` kind are inactivity bounds for one operation, not a total
-request deadline; raising the ceiling alone does not lengthen a slow read
-if the attempt budget stays fixed. Second, `start_to_close_timeout`
-restarts per attempt, so a retried ask's HTTP waits do not accumulate
-inside it; `schedule_to_close_timeout` is the only knob that covers
-attempts end to end, which matters when the server's `retry-after` hints
-stretch the total. Third, a timed-out attempt does not stop the Worker's
-request: without heartbeats no cancellation gets delivered, so the SDK's
-HTTP wait runs to its own cap and the provider may process the ask even
-though the attempt is recorded as timed out.
+`start_to_close_timeout` restarts per attempt, so it does not bound total
+duration across retries. `schedule_to_close_timeout` covers queueing, attempts,
+and backoff, including delays from server `retry-after` hints.
 
 ## Bring your own client
 
-For a backend whose settings come from elsewhere in your program, pass a
-constructed `typesafe_sdk.AsyncTypeSafeClient`:
+Configure the TypeSafe SDK client yourself, then pass it to the plugin:
 
 ```python
-plugin = TypeSafePlugin(client=client)  # any explicit client setting rejects here
+import os
+
+from typesafe_sdk import AsyncTypeSafeClient, RetryPolicy
+
+client = AsyncTypeSafeClient(
+    api_key=os.environ["TYPESAFE_API_KEY"],
+    base_url="http://localhost:8000",
+    headers={"X-Request-Source": "triage"},
+    retry=RetryPolicy(max_retries=0),
+)
+plugin = TypeSafePlugin(client)
 ```
 
-The plugin shares that instance across loops and Workers and never closes it;
-call `await client.aclose()` yourself. `client_factory=` instead builds a
-fresh client per Worker loop and closes it when that loop's last Worker
-stops. SDK-level retries are rejected on both paths.
+The caller owns the client and must close it with `await client.aclose()` when
+the Workers using it have stopped. SDK-level retries are rejected; configure
+`RetryPolicy(max_retries=0)` and use Temporal's Activity retry policy instead.
 
 ## Typed responses
 
 Questions are the SDK's native `Noul`, `Score`, and `Choice` models (or
 plain dicts with the same wire shape). To get SDK-validated
 answers, register the response class on the plugin and name it on the call.
-The workflow receives answers on the `AskResult` envelope and decodes them
+The workflow receives answers on the `SystemOneResult` envelope and decodes them
 as usual.
 
 ```python
@@ -185,10 +194,13 @@ class BillingResponse(SystemOneResponse):
 
 
 # Worker side:
-TypeSafePlugin(response_models={"billing": BillingResponse})
+TypeSafePlugin(
+    typesafe_client,
+    response_models={"billing": BillingResponse},
+)
 
 # Workflow side:
-result = await TemporalTypeSafe().ask(
+result = await TemporalTypeSafe().system_one(
     state,
     {"billing": Noul(instructions="Is this about billing?")},
     response_model="billing",
@@ -205,13 +217,11 @@ construction, and an unregistered name fails the Activity without retrying.
 
 ## Configuration
 
-The `typesafe` SDK reads these environment variables; a `TypeSafePlugin(...)`
-constructor kwarg with the same meaning takes precedence. The plugin builds
-the SDK client when it is constructed, or validates the one you inject, so
-bad settings fail at worker startup with the SDK's error.
+The TypeSafe SDK reads these environment variables when you construct the
+client. `TypeSafePlugin` accepts the configured client and does not duplicate
+its configuration options.
 
-- `TYPESAFE_API_KEY`: key for requests to the API. Required unless the
-  plugin kwarg sets one.
+- `TYPESAFE_API_KEY`: key for requests to the API.
 - `TYPESAFE_BASE_URL`: endpoint override.
 - `TYPESAFE_DEFAULT_MODEL`: model used when the call doesn't name one. The
   call can name one per question set (`TemporalTypeSafe(model=...)` or a
@@ -219,9 +229,6 @@ bad settings fail at worker startup with the SDK's error.
   Pin an exact version (`jev-1.13.0`, not `jev-latest`) once you have tuned
   thresholds: calibration can change between releases.
 - `TYPESAFE_LOG_LEVEL`: SDK logging level.
-
-A `None` plugin kwarg always defers to these variables; only an explicit
-kwarg overrides them.
 
 ## Develop
 

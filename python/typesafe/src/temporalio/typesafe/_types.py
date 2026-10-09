@@ -50,8 +50,8 @@ def lookup_response_model(name: str | None) -> type[SystemOneResponse] | None:
 
 
 @dataclasses.dataclass(kw_only=True)
-class AskInput:
-    """The ``ask`` Activity's single input: one unified JSON payload.
+class SystemOneInput:
+    """The ``system_one`` Activity's single input: one unified JSON payload.
 
     Keyword-only, and declared to open with the model name.
     """
@@ -63,7 +63,7 @@ class AskInput:
 
 
 @dataclasses.dataclass
-class AskResult:
+class SystemOneResult:
     """One request's native response plus its backend request ID.
 
     ``response`` is the SDK's own ``SystemOneResponse`` (answers, served
