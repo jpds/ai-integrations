@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-from zoneinfo import ZoneInfo
 
 import httpx2
 import pytest
@@ -76,7 +75,9 @@ def test_retry_after_seconds_converted() -> None:
 
 
 def test_retry_after_http_date_converted_from_now() -> None:
-    future = datetime.datetime.now(ZoneInfo("UTC")) + datetime.timedelta(seconds=7)
+    future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        seconds=7
+    )
     err = _api_error(
         429, headers={"retry-after": future.strftime("%a, %d %b %Y %H:%M:%S GMT")}
     )
